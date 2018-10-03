@@ -1,5 +1,19 @@
+# Use an existing volume
+
 Below you find the instruction on how to use an existing DigitalOcean Block
 Storage with your Kubernetes cluster.
+
+## Known issues
+
+* Deleting a `PVC` will delete the volume if the reclaim policy is set
+to `Delete`, however the bound `PV` will be not deleted. This seems to be a
+bug in K8S.
+* Using an existing, attached volume might cause confusion if the `POD` is
+scheduled to a different node. It's advised to use only existing **detached**
+volumes. If you have an attached volume, please make sure to detach it, so
+Kubernetes attaches it to the correct droplet.
+
+## Example
 
 To use an existing volume, we have to create manually a `PersistentVolume` (PV)
 resource. Here is an example `PersistenVolume` resource for an existing volume:
