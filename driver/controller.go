@@ -177,11 +177,90 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	ll.Info("delete volume called")
 
 	resp, err := d.doClient.Storage.DeleteVolume(ctx, req.VolumeId)
+	if err == nil {
+		ll.WithField("response", resp).Info("volume is deleted")
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+
+	// there are no ways to intepret the error, return it
+	if resp == nil {
+		return nil, err
+	}
+
+	// we assume it's deleted already for idempotency
+	if resp.StatusCode == http.StatusNotFound {
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+
+	if resp.StatusCode != http.StatusConflict {
+		ll.WithField("resp", resp).Info("unknown status code received")
+		return nil, err
+	}
+
+	if !strings.Contains(err.Error(), "A volume that's attached to a Droplet cannot be deleted") {
+		ll.WithError(err).Info("unknown error message received")
+		return nil, err
+	}
+
+	// TODO(arslan): remove this logic once the bug is fixed in k8s
+	// https: //github.com/kubernetes/kubernetes/issues/65552
+	// volume is still attached, but we receive a delete request. Try to detach it.
+	ll.WithFields(logrus.Fields{
+		"error": err,
+		"resp":  resp,
+	}).Warn("volume is already attached, trying to detach it")
+
+	vol, _, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+	if resp != nil && resp.StatusCode == http.StatusNotFound {
+		ll.WithField("response", resp).Info("volume does not exist")
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+
+	if len(vol.DropletIDs) == 0 {
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+
+	// keep it simple for now
+	if len(vol.DropletIDs) > 1 {
+		return nil, status.Error(codes.FailedPrecondition, fmt.Sprintf("can only detach from a single droplet, have %d droplets", len(vol.DropletIDs)))
+	}
+
+	dropletID := vol.DropletIDs[0]
+
+	action, resp, err := d.doClient.StorageActions.DetachByDropletID(ctx, req.VolumeId, dropletID)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			// we assume it's deleted already for idempotency
-			return &csi.DeleteVolumeResponse{}, nil
+		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
+			if strings.Contains(err.Error(), "Attachment not found") {
+				ll.WithFields(logrus.Fields{
+					"error": err,
+					"resp":  resp,
+				}).Warn("assuming volume is detached already")
+				return &csi.DeleteVolumeResponse{}, nil
+			}
+
+			if strings.Contains(err.Error(), "Droplet already has a pending event") {
+				ll.WithFields(logrus.Fields{
+					"error": err,
+					"resp":  resp,
+				}).Warn("droplet is not able to detach the volume")
+				// sending an abort makes sure the csi-attacher retries with the next backoff tick
+				return nil, status.Errorf(codes.Aborted, "volume %q couldn't be detached. droplet %d is in process of another action",
+					req.VolumeId, dropletID)
+			}
 		}
+
+		return nil, err
+	}
+
+	if action != nil {
+		ll.Info("waiting until volume is detached")
+		if err := d.waitAction(ctx, req.VolumeId, action.ID); err != nil {
+			return nil, err
+		}
+	}
+
+	resp, err = d.doClient.Storage.DeleteVolume(ctx, req.VolumeId)
+	if err != nil {
 		return nil, err
 	}
 
